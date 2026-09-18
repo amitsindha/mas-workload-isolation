@@ -143,6 +143,8 @@ first in customer environments.
   `--min-cpu-headroom-pct`     No                MAS               Default `15`
 
   `--min-mem-headroom-pct`     No                MAS               Default `15`
+  `--resume-from`              No                MAS               Script interface for phase
+                                                                   resume
 
   `--resume-from`              No                MAS               Script interface for phase
                                                                    resume
