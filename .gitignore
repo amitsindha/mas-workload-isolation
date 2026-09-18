@@ -1,0 +1,3 @@
+mas-workload-isolation-*/
+*.log
+.DS_Store
