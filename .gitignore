@@ -1,3 +1,6 @@
+# Generated discovery/isolation/validation artifacts
+cluster-discovery-report-*/
 mas-workload-isolation-*/
-*.log
+mas-workload-validation-*/
+*.tar.gz
 .DS_Store

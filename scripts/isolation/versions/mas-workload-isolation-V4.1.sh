@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# MAS Workload Isolation Orchestrator V4.0
-# Validated pattern based on EAM1 MAS 9.1.22 POC. v1.2 adds MAS-only health gates between migration phases.
+# MAS Workload Isolation Orchestrator V4.1
+# Validated pattern based on EAM1 MAS 9.1.22 POC.
+# V4.1 improvements:
+#   1. Zero cluster mutation before explicit YES confirmation.
+#   2. Progress messages + 5-minute OpenShift API request timeout for slow operations.
+#   3. Integrated migration progress monitor for MAS/SLS/MongoDB reconciliation.
+#   4. Optional AppCfg/Graphite discovery, supported CR patching, rollout and validation.
+#      Existing AppCfg podTemplates are merged/preserved; Graphite absence is N/A.
 set -Eeuo pipefail
-POLL_INTERVAL="${POLL_INTERVAL:-20}"; TIMEOUT="${TIMEOUT:-1800}"
+POLL_INTERVAL="${POLL_INTERVAL:-20}"; TIMEOUT="${TIMEOUT:-1800}"; OC_REQUEST_TIMEOUT="${OC_REQUEST_TIMEOUT:-300s}"
 COMPONENTS=""; INSTANCE=""; CORE_NS=""; MANAGE_NS=""; WORKSPACE="maximo"; LABEL_KEY="workload-group"; LABEL_VALUE=""; ALLOWED_NODES=""
 PRECHECK_ONLY=false; DRY_RUN=false; AUTO_LABEL=true; RESUME_FROM=""
 CAPACITY_PRECHECK=true; DB2_NS=""; MIN_CPU_HEADROOM_PCT=15; MIN_MEM_HEADROOM_PCT=15
@@ -11,7 +17,7 @@ DB2_NS=""; DB2_LABEL_KEY="workload-group"; DB2_LABEL_VALUE=""; DB2_ALLOWED_NODES
 
 usage(){ cat <<'EOF'
 Usage:
- ./mas-workload-isolation-V4.0.sh --components mas|sls|mongodb|db2|comma-separated combination --instance eam2 --core-namespace mas-eam2-core \
+ ./mas-workload-isolation-V4.1.sh --components mas|sls|mongodb|db2|comma-separated combination --instance eam2 --core-namespace mas-eam2-core \
  --manage-namespace mas-eam2-manage --workspace maximo \
  --label-key workload-group --label-value eam2 \
  --allowed-nodes worker-3,worker-4 [--auto-label|--no-auto-label] [--precheck-only] [--dry-run]
@@ -83,8 +89,20 @@ info(){ echo "[INFO] $*"; }; warn(){ echo "[WARN] $*"|tee -a "$RUN_DIR/reports/e
 trap 'echo "[FAIL] line $LINENO; see $LOG"' ERR
 regex(){ local x="" n;for n in "${NODES[@]}";do [[ -n "$x" ]]&&x+="|";x+="$n";done;echo "$x";}; ALLOWED_RE="$(regex)"
 
-wait_for(){ local d="$1";shift;local st=$(date +%s);info "Waiting: $d";while ! "$@" >/dev/null 2>&1;do
- (( $(date +%s)-st < TIMEOUT ))||die "Timeout: $d";sleep "$POLL_INTERVAL";done;info "Completed: $d"; }
+wait_for(){
+ local d="$1"; shift
+ local st now elapsed
+ st=$(date +%s)
+ info "Waiting: $d"
+ while ! "$@" >/dev/null 2>&1; do
+   now=$(date +%s); elapsed=$((now-st))
+   (( elapsed < TIMEOUT )) || die "Timeout: $d"
+   info "[PROGRESS] $d still reconciling; elapsed=${elapsed}s; next check in ${POLL_INTERVAL}s"
+   sleep "$POLL_INTERVAL"
+ done
+ now=$(date +%s); elapsed=$((now-st))
+ info "Completed: $d (elapsed=${elapsed}s)"
+}
 status_has(){ oc get "$1" "$2" -n "$3" -o jsonpath='{.status.podTemplates[*].name}' 2>/dev/null|tr ' ' '\n'|grep -Fxq "$4"; }
 affinity_ok(){ [[ "$(oc get "$1" "$2" -n "$3" -o jsonpath='{.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key}' 2>/dev/null)" == "$LABEL_KEY" ]]; }
 selector_ok(){ [[ "$(oc get buildconfig "$1" -n "$MANAGE_NS" -o "jsonpath={.spec.nodeSelector.${LABEL_KEY}}" 2>/dev/null)" == "$LABEL_VALUE" ]]; }
@@ -188,6 +206,205 @@ validate_placement_plans(){
     done
   done
   info "Global placement plan validation PASS"
+}
+
+precheck_target_labels(){
+  section "TARGET NODE LABEL PRECHECK - READ ONLY"
+  local n cur
+  for n in "${NODES[@]}"; do
+    oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$n" >/dev/null || die "node $n missing"
+    cur="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$n" -o "jsonpath={.metadata.labels.${LABEL_KEY}}" 2>/dev/null || true)"
+    if [[ "$cur" == "$LABEL_VALUE" ]]; then
+      info "$n already has $LABEL_KEY=$LABEL_VALUE"
+    elif [[ -z "$cur" ]]; then
+      $AUTO_LABEL || die "$n lacks $LABEL_KEY=$LABEL_VALUE and automatic labeling is disabled"
+      info "[PLAN] $n requires $LABEL_KEY=$LABEL_VALUE; label will be applied only after confirmation"
+    else
+      die "$n already has $LABEL_KEY=$cur; refusing to overwrite with $LABEL_VALUE"
+    fi
+  done
+}
+
+apply_target_labels(){
+  (has_component mas || has_component sls || has_component mongodb) || return 0
+  section "APPLYING TARGET NODE LABELS"
+  local n cur
+  for n in "${NODES[@]}"; do
+    cur="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$n" -o "jsonpath={.metadata.labels.${LABEL_KEY}}" 2>/dev/null || true)"
+    if [[ "$cur" == "$LABEL_VALUE" ]]; then
+      info "$n already has $LABEL_KEY=$LABEL_VALUE"
+    elif [[ -z "$cur" ]]; then
+      $AUTO_LABEL || die "$n lacks $LABEL_KEY=$LABEL_VALUE and automatic labeling is disabled"
+      if $DRY_RUN; then
+        info "DRY RUN: would add $LABEL_KEY=$LABEL_VALUE to $n"
+      else
+        info "Applying $LABEL_KEY=$LABEL_VALUE to $n"
+        oc --request-timeout="$OC_REQUEST_TIMEOUT" label node "$n" "$LABEL_KEY=$LABEL_VALUE"
+      fi
+    else
+      die "$n has conflicting $LABEL_KEY=$cur; refusing overwrite"
+    fi
+  done
+  oc --request-timeout="$OC_REQUEST_TIMEOUT" get nodes "${NODES[@]}" -L "$LABEL_KEY" | tee "$RUN_DIR/reports/node-labels.txt"
+}
+
+migration_progress(){
+  local phase="${1:-migration}" ns total running pending terminating problem_lines
+  section "MIGRATION PROGRESS - $phase"
+  echo "Target instance : ${INSTANCE:-N/A}"
+  echo "Target workers  : ${ALLOWED_NODES:-N/A}"
+  echo "This monitor is read-only."
+  for ns in "$CORE_NS" "$MANAGE_NS" "$SLS_NS" "$MONGO_NS"; do
+    [[ -n "$ns" ]] || continue
+    oc --request-timeout="$OC_REQUEST_TIMEOUT" get ns "$ns" >/dev/null 2>&1 || continue
+    total="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    running="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -n "$ns" --no-headers 2>/dev/null | awk '$3=="Running"{c++} END{print c+0}')"
+    pending="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -n "$ns" --no-headers 2>/dev/null | awk '$3=="Pending"{c++} END{print c+0}')"
+    terminating="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -n "$ns" 2>/dev/null | grep -c Terminating || true)"
+    echo
+    echo "[CHECKING] $ns : total=$total running=$running pending=$pending terminating=$terminating"
+    problem_lines="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -n "$ns" --no-headers 2>/dev/null |
+      grep -E 'Pending|Terminating|CrashLoopBackOff|Error|Failed|ImagePullBackOff|ErrImagePull|ContainerCreating|Init:|Unknown|Evicted' || true)"
+    if [[ -n "$problem_lines" ]]; then
+      echo "$problem_lines"
+    else
+      echo "Checking $ns - no pod issues currently detected"
+    fi
+  done
+}
+
+
+# ---------------- Optional AppCfg / Graphite support ----------------
+# Graphite is owned by AppCfg and is not a Suite podTemplate.  When AppCfg
+# exists, is enabled, and the generated graphite deployment exists, merge
+# workload affinity into AppCfg.spec.podTemplates using the supported key
+# "graphite-configuration".  Existing AppCfg podTemplates are preserved.
+discover_appcfg_graphite(){
+  APPCFG_NAME=""
+  GRAPHITE_ENABLED=false
+  has_component mas || return 0
+
+  APPCFG_NAME="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get appcfg -n "$CORE_NS" \
+    -l "mas.ibm.com/instanceId=$INSTANCE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+  if [[ -z "$APPCFG_NAME" ]]; then
+    info "Optional AppConfig/Graphite: AppCfg not found; skipping"
+    return 0
+  fi
+
+  local enabled dep
+  enabled="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get appcfg "$APPCFG_NAME" -n "$CORE_NS" \
+    -o jsonpath='{.spec.config.enabled}' 2>/dev/null || true)"
+  dep="${INSTANCE}-graphite-configuration"
+
+  if [[ "$enabled" == "true" ]] && oc --request-timeout="$OC_REQUEST_TIMEOUT" get deployment "$dep" -n "$CORE_NS" >/dev/null 2>&1; then
+    GRAPHITE_ENABLED=true
+    info "Optional AppConfig/Graphite discovered: AppCfg=$APPCFG_NAME Deployment=$dep"
+  else
+    info "Optional AppConfig/Graphite not active; skipping (AppCfg=$APPCFG_NAME enabled=${enabled:-unknown})"
+  fi
+}
+
+backup_appcfg(){
+  $GRAPHITE_ENABLED || return 0
+  oc --request-timeout="$OC_REQUEST_TIMEOUT" get appcfg "$APPCFG_NAME" -n "$CORE_NS" -o yaml \
+    > "$RUN_DIR/backups/appcfg-${APPCFG_NAME}.yaml"
+}
+
+patch_appcfg_graphite(){
+  $GRAPHITE_ENABLED || return 0
+  section "APPCONFIG / GRAPHITE ISOLATION"
+
+  backup_appcfg
+
+  local current merged patchfile
+  current="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get appcfg "$APPCFG_NAME" -n "$CORE_NS" -o json)"
+
+  # Merge by podTemplate name. Preserve every existing AppCfg podTemplate.
+  # Preserve an existing graphite template's non-affinity fields, but replace
+  # its affinity with the required workload-group affinity.
+  merged="$(jq -c --arg key "$LABEL_KEY" --arg val "$LABEL_VALUE" '
+    (.spec.podTemplates // []) as $pts |
+    {
+      spec: {
+        podTemplates:
+          (
+            [ $pts[] | select(.name != "graphite-configuration") ] +
+            [
+              (
+                ([ $pts[] | select(.name == "graphite-configuration") ][0] // {name:"graphite-configuration"})
+                + {
+                    affinity: {
+                      nodeAffinity: {
+                        requiredDuringSchedulingIgnoredDuringExecution: {
+                          nodeSelectorTerms: [
+                            {
+                              matchExpressions: [
+                                {key:$key, operator:"In", values:[$val]}
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+              )
+            ]
+          )
+      }
+    }' <<<"$current")"
+
+  patchfile="$RUN_DIR/patches/appcfg-${APPCFG_NAME}-graphite-affinity.json"
+  printf '%s\n' "$merged" | jq . > "$patchfile"
+
+  if $DRY_RUN; then
+    info "DRY RUN: would patch AppCfg $APPCFG_NAME for graphite-configuration"
+    cat "$patchfile"
+    return 0
+  fi
+
+  info "Patching supported AppCfg podTemplate: graphite-configuration"
+  oc --request-timeout="$OC_REQUEST_TIMEOUT" patch appcfg "$APPCFG_NAME" -n "$CORE_NS" \
+    --type=merge --patch-file "$patchfile"
+
+  wait_for "AppCfg $APPCFG_NAME Ready" \
+    bash -c "oc --request-timeout='$OC_REQUEST_TIMEOUT' get appcfg '$APPCFG_NAME' -n '$CORE_NS' -o json | jq -e '.status.conditions[]? | select(.type==\"Ready\" and .status==\"True\")'"
+
+  info "Waiting for Graphite deployment rollout"
+  oc --request-timeout="$OC_REQUEST_TIMEOUT" rollout status deployment/"${INSTANCE}-graphite-configuration" \
+    -n "$CORE_NS" --timeout="${TIMEOUT}s"
+
+  migration_progress "AppConfig / Graphite"
+}
+
+validate_appcfg_graphite(){
+  $GRAPHITE_ENABLED || {
+    info "AppConfig / Graphite validation: N/A (optional component not active)"
+    return 0
+  }
+
+  local dep="${INSTANCE}-graphite-configuration"
+  local bad=0 total=0 pod node phase
+  while IFS='|' read -r pod phase node; do
+    [[ -n "$pod" ]] || continue
+    ((total+=1))
+    if [[ "$phase" != "Running" ]] || ! node_allowed "$node"; then
+      ((bad+=1))
+      warn "Graphite violation: pod=$pod phase=$phase node=${node:-<none>}"
+    fi
+  done < <(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -n "$CORE_NS" \
+    -l "app=$dep" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{.spec.nodeName}{"\n"}{end}' 2>/dev/null)
+
+  if (( total == 0 )); then
+    warn "Graphite deployment exists but no Graphite pod was found"
+    return 1
+  fi
+  if (( bad > 0 )); then
+    warn "AppConfig / Graphite isolation FAIL: $bad/$total pod(s) not Running on target workers"
+    return 1
+  fi
+  info "AppConfig / Graphite isolation PASS: $total pod(s) Running on target workers"
 }
 
 confirm_change(){
@@ -300,6 +517,7 @@ print(c,m)')
 
 capacity_precheck(){
   section "CAPACITY / SCHEDULING PRECHECK"
+  info "[PROGRESS] Starting read-only capacity and scheduling checks"
   local report="$RUN_DIR/reports/capacity-precheck.txt"
   local tmp="$RUN_DIR/reports/.capacity.tsv"
   : >"$tmp"
@@ -317,11 +535,12 @@ capacity_precheck(){
 
   local fail=0 node cpuA cpuR memA memR cpuFree memFree
   for node in "${NODES[@]}"; do
+    info "[PROGRESS] Reading allocatable capacity and current pod requests for $node"
     # Kubernetes quantities are normalized by jq: CPU to cores, memory to bytes.
-    cpuA="$(oc get node "$node" -o json | jq -r '.status.allocatable.cpu')"
-    memA="$(oc get node "$node" -o json | jq -r '.status.allocatable.memory')"
+    cpuA="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$node" -o json | jq -r '.status.allocatable.cpu')"
+    memA="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$node" -o json | jq -r '.status.allocatable.memory')"
     # Sum scheduler requests for all non-terminal pods already assigned to the node.
-    read -r cpuR memR < <(oc get pods -A --field-selector "spec.nodeName=$node" -o json | python3 -c '
+    read -r cpuR memR < <(oc --request-timeout="$OC_REQUEST_TIMEOUT" get pods -A --field-selector "spec.nodeName=$node" -o json | python3 -c '
 import json,sys,re
 d=json.load(sys.stdin)
 def cpu(v):
@@ -357,10 +576,12 @@ PY
     cpuFree="$(python3 -c "print(round(max(0,(float('$cpuAC')-float('$cpuR'))/float('$cpuAC')*100),1))")"
     memFree="$(python3 -c "print(round(max(0,(float('$memAM')-float('$memR'))/float('$memAM')*100),1))")"
     printf "%-18s %12.2f %12.2f %9s%% %14.0f %14.0f %9s%%\n" "$node" "$cpuAC" "$cpuR" "$cpuFree" "$memAM" "$memR" "$memFree" | tee -a "$report"
+    info "[PROGRESS] Capacity calculation completed for $node"
     python3 -c "import sys;sys.exit(0 if float('$cpuFree') >= float('$MIN_CPU_HEADROOM_PCT') else 1)" || fail=1
     python3 -c "import sys;sys.exit(0 if float('$memFree') >= float('$MIN_MEM_HEADROOM_PCT') else 1)" || fail=1
   done
 
+  info "[PROGRESS] Reading current MAS Core/Manage workload placement"
   echo | tee -a "$report"
   echo "Current EAM workload requests (informational; some are already on target nodes):" | tee -a "$report"
   for ns in "$CORE_NS" "$MANAGE_NS"; do
@@ -377,18 +598,21 @@ PY
     fi
   fi
 
+  info "[PROGRESS] Checking recent FailedScheduling events"
   echo | tee -a "$report"; echo "Recent FailedScheduling events:" | tee -a "$report"
   oc get events -A --field-selector reason=FailedScheduling --sort-by=.lastTimestamp 2>/dev/null | tail -20 | tee -a "$report" || true
 
-  if command -v oc >/dev/null && oc adm top nodes >/dev/null 2>&1; then
+  info "[PROGRESS] Checking current node metrics (informational)"
+  if command -v oc >/dev/null && oc --request-timeout="$OC_REQUEST_TIMEOUT" adm top nodes >/dev/null 2>&1; then
     echo | tee -a "$report"; echo "Current metrics (informational, not scheduler capacity):" | tee -a "$report"
-    oc adm top nodes "${NODES[@]}" 2>/dev/null | tee -a "$report" || true
+    oc --request-timeout="$OC_REQUEST_TIMEOUT" adm top nodes "${NODES[@]}" 2>/dev/null | tee -a "$report" || true
   fi
 
   if ((fail)); then
     die "Capacity gate failed: one or more target nodes are below configured request-headroom thresholds. Review $report"
   fi
   info "Capacity gate PASS (request-headroom check). Rolling updates may temporarily need additional capacity."
+  info "[PROGRESS] Capacity / scheduling precheck completed"
 }
 
 
@@ -474,6 +698,7 @@ mas_health_gate(){
     fi
 
     info "MAS workloads are still converging for phase $phase; retrying in ${POLL_INTERVAL}s"
+    migration_progress "MAS $phase"
     sleep "$POLL_INTERVAL"
   done
 }
@@ -565,6 +790,7 @@ mongodb_phase(){
     else
       good=0
       info "MongoDB reconciling: phase=$ph ready=$rd/$rp placement=$(mongodb_placement_compliant && echo OK || echo DRIFT)"
+      migration_progress "MongoDB"
     fi
     ((good>=MONGO_STABLE_CHECKS)) && break
     (( $(date +%s)-start < TIMEOUT )) || die "MongoDB stabilization/placement timeout"
@@ -579,26 +805,41 @@ db2_allowed_json(){ printf '%s\n' "${DB2_NODES[@]}" | jq -R . | jq -s .; }
 
 ensure_db2_labels(){
   has_component db2 || return 0
-  section "DB2 TARGET NODE LABEL PRECHECK"
+  section "DB2 TARGET NODE LABEL PRECHECK - READ ONLY"
   local n cur
   for n in "${DB2_NODES[@]}"; do
-    oc get node "$n" >/dev/null || die "DB2 target node not found: $n"
-    cur="$(oc get node "$n" -o jsonpath="{.metadata.labels.${DB2_LABEL_KEY}}" 2>/dev/null || true)"
+    oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$n" >/dev/null || die "DB2 target node not found: $n"
+    cur="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$n" -o jsonpath="{.metadata.labels.${DB2_LABEL_KEY}}" 2>/dev/null || true)"
     if [[ "$cur" == "$DB2_LABEL_VALUE" ]]; then
       info "$n already has $DB2_LABEL_KEY=$DB2_LABEL_VALUE"
     elif [[ -z "$cur" ]]; then
-      if $PRECHECK_ONLY || $DRY_RUN; then
-        warn "$n lacks $DB2_LABEL_KEY=$DB2_LABEL_VALUE; would add it during execution"
-      elif $AUTO_LABEL; then
-        oc label node "$n" "$DB2_LABEL_KEY=$DB2_LABEL_VALUE"
+      $AUTO_LABEL || die "$n lacks $DB2_LABEL_KEY=$DB2_LABEL_VALUE"
+      info "[PLAN] $n requires $DB2_LABEL_KEY=$DB2_LABEL_VALUE; label will be applied only after confirmation"
+    else
+      die "$n has conflicting $DB2_LABEL_KEY=$cur; refusing overwrite"
+    fi
+  done
+}
+apply_db2_labels(){
+  has_component db2 || return 0
+  section "APPLYING DB2 TARGET NODE LABELS"
+  local n cur
+  for n in "${DB2_NODES[@]}"; do
+    cur="$(oc --request-timeout="$OC_REQUEST_TIMEOUT" get node "$n" -o jsonpath="{.metadata.labels.${DB2_LABEL_KEY}}" 2>/dev/null || true)"
+    if [[ "$cur" == "$DB2_LABEL_VALUE" ]]; then
+      info "$n already has $DB2_LABEL_KEY=$DB2_LABEL_VALUE"
+    elif [[ -z "$cur" ]]; then
+      $AUTO_LABEL || die "$n lacks $DB2_LABEL_KEY=$DB2_LABEL_VALUE"
+      if $DRY_RUN; then
+        info "DRY RUN: would add $DB2_LABEL_KEY=$DB2_LABEL_VALUE to $n"
       else
-        die "$n lacks $DB2_LABEL_KEY=$DB2_LABEL_VALUE"
+        oc --request-timeout="$OC_REQUEST_TIMEOUT" label node "$n" "$DB2_LABEL_KEY=$DB2_LABEL_VALUE"
       fi
     else
       die "$n has conflicting $DB2_LABEL_KEY=$cur; refusing overwrite"
     fi
   done
-  oc get nodes "${DB2_NODES[@]}" -L "$DB2_LABEL_KEY"
+  oc --request-timeout="$OC_REQUEST_TIMEOUT" get nodes "${DB2_NODES[@]}" -L "$DB2_LABEL_KEY"
 }
 
 db2_cluster_healthy(){
@@ -656,7 +897,7 @@ db2_precheck(){
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
   )
   ((${#DB2_CLUSTERS[@]})) || die "No Db2uCluster found in $DB2_NS"
-  info "V4.0 DB2 scope: IBM MAS Manage DB2U only; Monitor/Predict excluded."
+  info "V4.1 DB2 scope: IBM MAS Manage DB2U only; Monitor/Predict excluded."
   printf 'Discovered Db2uClusters:\n'
   printf '  %s\n' "${DB2_CLUSTERS[@]}"
   local db bad
@@ -805,17 +1046,7 @@ command -v oc>/dev/null||die "oc missing";command -v jq>/dev/null||die "jq missi
 if ! has_component mas; then
   # Common target is needed only for SLS/MongoDB.
   if has_component sls || has_component mongodb; then
-    for n in "${NODES[@]}"; do
-      oc get node "$n" >/dev/null || die "node $n missing"
-      v="$(oc get node "$n" -o "jsonpath={.metadata.labels.${LABEL_KEY}}" 2>/dev/null || true)"
-      if [[ "$v" == "$LABEL_VALUE" ]]; then info "$n already has $LABEL_KEY=$LABEL_VALUE"
-      elif [[ -z "$v" ]]; then
-        if $PRECHECK_ONLY || $DRY_RUN; then warn "$n lacks $LABEL_KEY=$LABEL_VALUE; would add it during execution"
-        elif $AUTO_LABEL; then oc label node "$n" "$LABEL_KEY=$LABEL_VALUE"
-        else die "$n lacks $LABEL_KEY=$LABEL_VALUE"; fi
-      else die "$n has conflicting $LABEL_KEY=$v; refusing overwrite"; fi
-    done
-    oc get nodes "${NODES[@]}" -L "$LABEL_KEY"
+    precheck_target_labels
   fi
 
   has_component db2 && ensure_db2_labels
@@ -858,30 +1089,10 @@ if ! has_component mas; then
 fi
 
 oc get ns "$CORE_NS">/dev/null;oc get ns "$MANAGE_NS">/dev/null
-for n in "${NODES[@]}"; do
-  oc get node "$n" >/dev/null || die "node $n missing"
-  v="$(oc get node "$n" -o "jsonpath={.metadata.labels.${LABEL_KEY}}" 2>/dev/null || true)"
-  if [[ "$v" == "$LABEL_VALUE" ]]; then
-    info "$n already has ${LABEL_KEY}=${LABEL_VALUE}"
-  elif [[ -z "$v" ]]; then
-    if $AUTO_LABEL; then
-      if $DRY_RUN; then
-        info "DRY RUN: would add label ${LABEL_KEY}=${LABEL_VALUE} to $n"
-      else
-        info "Adding missing label ${LABEL_KEY}=${LABEL_VALUE} to $n"
-        oc label node "$n" "${LABEL_KEY}=${LABEL_VALUE}"
-      fi
-    else
-      die "$n has no ${LABEL_KEY} label and automatic labeling is disabled"
-    fi
-  else
-    # Never silently overwrite a node already assigned to another workload group.
-    die "$n already has ${LABEL_KEY}=${v}; refusing to overwrite with ${LABEL_VALUE}"
-  fi
-done
-oc get nodes -L "$LABEL_KEY"|tee "$RUN_DIR/reports/node-labels.txt"
+precheck_target_labels
 has_component db2 && ensure_db2_labels
 discover_mas_instances
+discover_appcfg_graphite
 validate_placement_plans
 $CAPACITY_PRECHECK && capacity_precheck
 $CAPACITY_PRECHECK && projected_migration_capacity
@@ -898,6 +1109,9 @@ snapshot before
 : >"$RUN_DIR/reports/compliance.txt"
 confirm_change
 $PRECHECK_ONLY&&{ section "PRECHECK ONLY COMPLETE";echo "No changes made. $RUN_DIR";exit 0; }
+# V4.1: first cluster mutation happens only after explicit YES.
+apply_target_labels
+has_component db2 && apply_db2_labels
 
 SUITE_KEYS=(admin-dashboard catalogapi catalogmgr coreapi entitymgr-addons entitymgr-appcfg entitymgr-bascfg entitymgr-coreidp entitymgr-idpcfg entitymgr-jdbccfg entitymgr-kafkacfg entitymgr-mongocfg entitymgr-objectstorage entitymgr-pushnotificationcfg entitymgr-scimcfg entitymgr-slscfg entitymgr-smtpcfg entitymgr-suite entitymgr-watsonstudiocfg entitymgr-ws groupsync-coordinator homepage internalapi ltpakeygenerator mobileapi monagent-mas navigator usersync-coordinator workspace-coordinator)
 BAS_KEYS=(accapppoints usage-daily usage-historical adoptionusage-reporter adoptionusageapi milestonesapi)
@@ -915,6 +1129,11 @@ if [[ -n "$SLS" ]];then section SLSCFG;patch_keys slscfg slscfg "$SLS" "$CORE_NS
  $DRY_RUN || mas_health_gate slscfg
 fi
 section MANAGEAPP;patch_keys manageapp manageapp "$MAPP" "$MANAGE_NS" "${MAPP_KEYS[@]}"; $DRY_RUN || mas_health_gate manageapp
+
+if has_component mas; then
+  patch_appcfg_graphite
+  validate_appcfg_graphite || true
+fi
 
 section "MANAGEWORKSPACE: MONITOR + BUILDS"
 WS_CHANGED=true
@@ -950,6 +1169,13 @@ snapshot after
 
 section "CONFIGURATION COMPLIANCE SUMMARY"
 cat "$RUN_DIR/reports/compliance.txt" || true
+
+section "APPCONFIG / GRAPHITE FINAL VALIDATION"
+if has_component mas; then
+  if ! validate_appcfg_graphite; then
+    echo "AppConfig/Graphite placement violation" >> "$RUN_DIR/reports/exceptions.txt"
+  fi
+fi
 
 section "FINAL VALIDATION"
 FINAL_REPORT="$RUN_DIR/reports/final-validation.txt"

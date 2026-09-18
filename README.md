@@ -1,222 +1,135 @@
-# IBM MAS Workload Isolation Orchestrator V4.0
+# IBM MAS Workload Isolation Toolkit
 
-GitHub-ready OpenShift workload-placement project for IBM Maximo
-Application Suite (MAS) **Manage**.
+A practical OpenShift toolkit for **IBM Maximo Application Suite (MAS)** workload discovery, worker-node isolation, and independent post-migration validation.
 
-> **Scope:** V4.0 covers MAS Manage, SLS, MongoDB Community and Manage
-> Db2U. Monitor/Predict-specific DB2 designs are intentionally excluded
-> until separately validated.
+The toolkit is organized around a simple operational workflow:
+
+```text
+Install → Discover → Review / Plan → Isolate → Validate
+```
+
+## Stable commands
+
+The README always uses versionless stable entry points:
+
+```bash
+./scripts/discovery/mas-cluster-discovery.sh
+./scripts/isolation/mas-workload-isolation.sh
+./scripts/validation/mas-workload-isolation-validation.sh
+```
+
+Exact tested versions are retained under each component's `versions/` directory for traceability.
 
 ## Repository layout
 
-``` text
-mas-workload-isolation-V4.0/
+```text
+mas-workload-isolation/
 ├── README.md
+├── CHANGELOG.md
+├── .gitignore
+├── install/
+│   ├── install-toolkit.sh
+│   ├── mas-toolkit-resources.yaml
+│   └── README.md
 ├── scripts/
-│   └── mas-workload-isolation-V4.0.sh
-└── docs/
+│   ├── discovery/
+│   │   ├── mas-cluster-discovery.sh
+│   │   └── versions/mas-cluster-discovery-v1.5.sh
+│   ├── isolation/
+│   │   ├── mas-workload-isolation.sh
+│   │   └── versions/mas-workload-isolation-V4.1.sh
+│   └── validation/
+│       ├── mas-workload-isolation-validation.sh
+│       └── versions/mas-workload-isolation-validation-V1.0.sh
+├── docs/
+│   ├── DISCOVERY.md
+│   ├── ISOLATION.md
+│   ├── VALIDATION.md
+│   └── TROUBLESHOOTING.md
+└── examples/
     └── README.md
 ```
 
-## Reference architecture
+## 1. Install the toolkit runtime
 
-``` text
-OpenShift
-├─ worker-1, worker-2   workload-group=eam1
-│  ├─ EAM1 MAS Core + Manage
-│  ├─ EAM1 MAS Core/Manage OLM operators
-│  ├─ EAM1 SLS
-│  └─ EAM1 MongoDB
-├─ worker-3, worker-4   workload-group=eam2
-│  ├─ EAM2 MAS Core + Manage
-│  ├─ EAM2 MAS Core/Manage OLM operators
-│  ├─ EAM2 SLS
-│  └─ EAM2 MongoDB
-└─ worker-5             workload-group=db2
-   ├─ EAM1 Manage DB2 + ETCD + LDAP
-   ├─ EAM2 Manage DB2 + ETCD + LDAP
-   ├─ db2u-operator-manager
-   └─ db2u-day2-ops-controller-manager
+The developer workstation needs the `oc` CLI and a local copy of this repository. The installer creates a persistent MAS CLI pod in OpenShift and copies the **local repository contents** into `/mascli/mas-workload-isolation`.
+
+```bash
+chmod +x install/install-toolkit.sh
+./install/install-toolkit.sh
 ```
 
-The script adds a missing target label automatically, but **never
-overwrites a conflicting existing label**.
+If there is no active OpenShift session, the installer prompts for the API URL, username, and a hidden password. Self-signed/untrusted API certificates are accepted by default. See [install/README.md](install/README.md).
 
-## Components
+> The supplied runtime uses a cluster-admin service account because isolation performs cluster-level placement changes. Review this RBAC with the customer's OpenShift security team.
 
-`--components` accepts `mas`, `sls`, `mongodb`, `db2`, or a
-comma-separated combination.
+## 2. Discovery
 
--   **mas** --- MAS Core/Manage CR pod templates, Manage workspace,
-    MAXINST, server bundles, build selectors and MAS OLM operator
-    Subscriptions.
--   **sls** --- SLS API placement using
-    `LicenseService.spec.podTemplates`.
--   **mongodb** --- MongoDBCommunity CR affinity, generated StatefulSet
-    affinity and actual member placement.
--   **db2** --- Manage Db2U `Db2uCluster.spec.affinity` plus
-    `Subscription/db2u-operator.spec.config.affinity`.
+Discovery is read-only. It inventories worker capacity, MAS instances, Manage topology, optional AppConfig/Graphite, SLS, MongoDB, Db2U, PVCs, ownership, affinity and current placement.
 
-## Processing model
-
-``` text
-Discover → Precheck → Capacity/health → Compare current vs desired
-        → COMPLIANT: SKIP change, validate
-        → DRIFT: backup → server dry-run → patch → reconcile
-        → final PASS / WARNING / FAIL
+```bash
+./scripts/discovery/mas-cluster-discovery.sh
 ```
 
-Completed/Succeeded pods are historical/informational; Running workloads
-drive placement validation.
+Primary output includes `REPORT.html`, `REPORT.txt`, summary files and raw structured data. See [docs/DISCOVERY.md](docs/DISCOVERY.md).
 
-## Prerequisites
+## 3. Isolation
 
-`oc`, `jq`, `python3`, an authenticated OpenShift session with required
-RBAC, and adequate target-node/storage capacity. Run `--precheck-only`
-first in customer environments.
+Always run precheck first in a customer environment.
 
-## Parameters
-
-  ------------------------------------------------------------------------------------------------
-  Parameter                    Required          Scope             Meaning
-  ---------------------------- ----------------- ----------------- -------------------------------
-  `--components`               Yes               All               `mas`, `sls`, `mongodb`, `db2`,
-                                                                   or combination
-
-  `--instance`                 MAS               MAS               MAS instance ID, e.g. `eam1`
-
-  `--core-namespace`           MAS               MAS               e.g. `mas-eam1-core`
-
-  `--manage-namespace`         MAS               MAS               e.g. `mas-eam1-manage`
-
-  `--workspace`                No                MAS               Manage workspace; default
-                                                                   `maximo`
-
-  `--label-key`                No                MAS/SLS/MongoDB   Default `workload-group`
-
-  `--label-value`              Yes\*             MAS/SLS/MongoDB   e.g. `eam1`
-
-  `--allowed-nodes`            Yes\*             MAS/SLS/MongoDB   e.g. `worker-1,worker-2`
-
-  `--sls-namespace`            SLS               SLS               e.g. `ibm-sls`
-
-  `--mongodb-namespace`        MongoDB           MongoDB           e.g. `mongoce`
-
-  `--mongodb-name`             No                MongoDB           Default `mas-mongo-ce`
-
-  `--mongodb-stable-checks`    No                MongoDB           Default `3`
-
-  `--db2-namespace`            DB2               DB2               e.g. `db2u`
-
-  `--db2-label-key`            No                DB2               Default `workload-group`
-
-  `--db2-label-value`          DB2               DB2               e.g. `db2`
-
-  `--db2-allowed-nodes`        DB2               DB2               e.g. `worker-5`
-
-  `--db2-stable-checks`        No                DB2               Default `3`
-
-  `--mas-instances`            No                MAS               Inventory scope, e.g. `auto` or
-                                                                   `eam1,eam2`
-
-  `--placement-plan`           No/repeatable     MAS               e.g. `eam1=worker-1,worker-2`
-
-  `--precheck-only`            No                All               Read-only discovery/precheck
-
-  `--dry-run`                  No                All               Validate intended changes
-                                                                   without normal apply
-
-  `--auto-label`               No                All               Add missing labels; default
-
-  `--no-auto-label`            No                All               Fail if target labels are
-                                                                   missing
-
-  `--force-reapply`            No                All               Reapply even if compliant
-
-  `--yes`                      No                All               Skip interactive YES
-                                                                   confirmation
-
-  `--external-db`              No                MAS               MAS database is external to OCP
-
-  `--skip-capacity-precheck`   No                MAS               Disable request-headroom gate
-
-  `--min-cpu-headroom-pct`     No                MAS               Default `15`
-
-  `--min-mem-headroom-pct`     No                MAS               Default `15`
-  
-  `--resume-from`              No                MAS               Script interface for phase
-                                                                   resume
- 
-  ------------------------------------------------------------------------------------------------
-
-`*` Required when any of MAS/SLS/MongoDB is selected.
-
-Environment: `POLL_INTERVAL=20`, `TIMEOUT=1800` by default.
-
-## Example: MAS only
-
-``` bash
-./scripts/mas-workload-isolation-V4.0.sh --components mas \
-  --instance eam1 --core-namespace mas-eam1-core --manage-namespace mas-eam1-manage \
-  --workspace maximo --label-key workload-group --label-value eam1 \
-  --allowed-nodes worker-1,worker-2
+```bash
+./scripts/isolation/mas-workload-isolation.sh   --components mas,sls,mongodb   --instance eam   --core-namespace mas-eam-core   --manage-namespace mas-eam-manage   --workspace maximo   --sls-namespace ibm-sls-eam   --mongodb-namespace mongoce-eam   --mongodb-name mas-mongo-ce   --label-key workload-group   --label-value eam   --allowed-nodes worker-1,worker-2,worker-3   --external-db   --precheck-only
 ```
 
-## Example: SLS only
+Remove only `--precheck-only` after reviewing capacity, topology, target workers and labels. V4.1.1 does not mutate target labels before explicit confirmation.
 
-``` bash
-./scripts/mas-workload-isolation-V4.0.sh --components sls \
-  --sls-namespace ibm-sls --label-key workload-group --label-value eam1 \
-  --allowed-nodes worker-1,worker-2
+Isolation supports MAS, SLS, MongoDB Community and Manage Db2U. Optional AppConfig/Graphite is discovered and handled through its supported AppCfg pod template. Manage server bundles are discovered from the environment rather than requiring an `ALL` bundle.
+
+See [docs/ISOLATION.md](docs/ISOLATION.md).
+
+## 4. Validation
+
+Validation is independently read-only:
+
+```bash
+./scripts/validation/mas-workload-isolation-validation.sh   --instance eam   --core-namespace mas-eam-core   --manage-namespace mas-eam-manage   --sls-namespace ibm-sls-eam   --mongodb-namespace mongoce-eam   --label-key workload-group   --label-value eam   --allowed-nodes worker-1,worker-2,worker-3
 ```
 
-## Example: MongoDB only
+It separates application/database placement from supporting controllers/operators and reports optional components as N/A when absent.
 
-``` bash
-./scripts/mas-workload-isolation-V4.0.sh --components mongodb \
-  --mongodb-namespace mongoce --mongodb-name mas-mongo-ce \
-  --label-key workload-group --label-value eam1 --allowed-nodes worker-1,worker-2
-```
+## Current stable versions
 
-## Example: DB2 only
+| Component | Stable source |
+|---|---|
+| Discovery | v1.5 |
+| Isolation | V4.1.1 |
+| Validation | V1.0 |
+| Installer | Initial toolkit installer |
 
-``` bash
-./scripts/mas-workload-isolation-V4.0.sh --components db2 \
-  --db2-namespace db2u --db2-label-key workload-group \
-  --db2-label-value db2 --db2-allowed-nodes worker-5
-```
+## Safety model
 
-## Example: full EAM1 run
+- Discovery and validation are read-only.
+- Isolation performs a read-only precheck before confirmation.
+- Missing target labels are planned first and applied only after confirmation.
+- Conflicting existing workload-group labels are not overwritten.
+- Isolation creates timestamped backups, patches, reports and a run log.
+- Use `--precheck-only` before production changes.
+- Review storage accessibility and target-node capacity before migration.
 
-``` bash
-./scripts/mas-workload-isolation-V4.0.sh \
-  --components mas,sls,mongodb,db2 \
-  --instance eam1 --core-namespace mas-eam1-core --manage-namespace mas-eam1-manage \
-  --workspace maximo --sls-namespace ibm-sls \
-  --mongodb-namespace mongoce --mongodb-name mas-mongo-ce \
-  --label-key workload-group --label-value eam1 --allowed-nodes worker-1,worker-2 \
-  --db2-namespace db2u --db2-label-key workload-group \
-  --db2-label-value db2 --db2-allowed-nodes worker-5
-```
+## Scope notes
 
-## Two-instance placement-plan example
+MAS environments vary. JMS and AppConfig/Graphite are optional. Manage may use `ALL` or split bundles such as UI, MEA, CRON and REPORT; some environments may have no Manage runtime workload. Supporting operators/controllers are evaluated separately from application placement.
 
-``` bash
---mas-instances eam1,eam2 \
---placement-plan eam1=worker-1,worker-2 \
---placement-plan eam2=worker-3,worker-4
-```
+## Documentation
 
-## Results
+Start with:
+- [Installation](install/README.md)
+- [Discovery](docs/DISCOVERY.md)
+- [Isolation](docs/ISOLATION.md)
+- [Validation](docs/VALIDATION.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Examples](examples/README.md)
 
--   **PASS** --- targeted workloads reached desired placement and health
-    gates passed.
--   **WARNING** --- application isolation passed but a non-blocking
-    supporting exception needs review.
--   **FAIL** --- blocking scheduling, capacity, health, timeout or
-    placement validation failed.
+## Disclaimer
 
-Each run creates a timestamped directory with `backups/`, `patches/`,
-`reports/`, and `run.log`.
-
-See `docs/README.md` for the source-code component guide.
+Test in a non-production environment first. Review generated backups and reports, OpenShift RBAC, storage behavior, workload capacity and IBM MAS version-specific behavior before production use.
