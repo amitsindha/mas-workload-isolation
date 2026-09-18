@@ -146,9 +146,7 @@ first in customer environments.
   
   `--resume-from`              No                MAS               Script interface for phase
                                                                    resume
-
-  `--resume-from`              No                MAS               Script interface for phase
-                                                                   resume
+ 
   ------------------------------------------------------------------------------------------------
 
 `*` Required when any of MAS/SLS/MongoDB is selected.
